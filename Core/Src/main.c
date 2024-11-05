@@ -44,6 +44,9 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
+
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim4;
 TIM_HandleTypeDef htim6;
@@ -52,14 +55,27 @@ TIM_HandleTypeDef htim7;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+const float LIMIT_ANGLE_H=1.8;
+const float LIMIT_ANGLE_V=1.0;
+const float T = 0.05; //補間時間 プリスケーラ9000 コンペア500
+const int PULSE_LIMIT=40000;
+
 uint8_t dma_rx_buff[1];
-uint8_t rx_buff[256];
-uint8_t tx_buff[256];
+uint8_t rx_buff[128];
+uint8_t tx_buff[128];
+
+uint16_t g_ADCBuffer[4];
+uint16_t link1_adc=0;
+uint16_t link2_adc=0;
+uint16_t link3_adc=0;
+uint16_t link4_adc=0;
+uint8_t grab_pin=0;
+
 State state = {
 	0,
 	0.0,
 	0.0,
-	0.0,
+	30.0,
 	0.0,
 	0,
 	0
@@ -69,7 +85,7 @@ State now_state = {
 	0,
 	0.0,
 	0.0,
-	0.0,
+	30.0,
 	0.0,
 	0,
 	0
@@ -79,7 +95,7 @@ State tgt_state = {
 	0,
 	0.0,
 	0.0,
-	0.0,
+	30.0,
 	0.0,
 	0,
 	0
@@ -89,7 +105,7 @@ State pre_state = {
 	0,
 	0.0,
 	0.0,
-	0.0,
+	30.0,
 	0.0,
 	0,
 	0
@@ -105,11 +121,13 @@ uint8_t link4_str[6];
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_TIM6_Init(void);
 static void MX_TIM7_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_TIM4_Init(void);
+static void MX_ADC1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -119,20 +137,20 @@ static void MX_TIM4_Init(void);
 
 int deg2pulse(float deg)
 {
-	int pulse = (int)(3000.0f+2000.0f/90.0f*deg);
+	int pulse = (int)(3000.0+2000.0/90.0*deg);
 	if (pulse>=1000 && pulse <=5000)
 	{
-		return pulse;
+		return PULSE_LIMIT-pulse;
 	}
 	else
 	{
-		return 3000;
+		return PULSE_LIMIT-3000;
 	}
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     if (huart->Instance == USART2) {
-    	if (state.counter<256){
+    	if (state.counter<128){
     		if(dma_rx_buff[0]=='\n'){
     			rx_buff[state.counter]=dma_rx_buff[0];
     			UpdateTarget();
@@ -207,63 +225,102 @@ void UpdateTarget(){
 		state.mode=rx_buff[31];
 		if (state.glab=='1')
 		{
-			__HAL_TIM_SET_COMPARE(&htim3,TIM_CHANNEL_1,1500); //1000(0.5ms)~3000(1.5ms)~5000(2.5ms)
+			__HAL_TIM_SET_COMPARE(&htim3,TIM_CHANNEL_1,40000-1500); //1000(0.5ms)~3000(1.5ms)~5000(2.5ms)
 		}
 		else
 		{
-			__HAL_TIM_SET_COMPARE(&htim3,TIM_CHANNEL_1,3000); //1000(0.5ms)~3000(1.5ms)~5000(2.5ms)
+			__HAL_TIM_SET_COMPARE(&htim3,TIM_CHANNEL_1,40000-3000); //1000(0.5ms)~3000(1.5ms)~5000(2.5ms)
 		}
+	}
+	else
+	{
 	}
 }
 
+float update_tgt_h(float state_link,float tgt_link)
+{
+	if (abs(state_link-tgt_link)>LIMIT_ANGLE_H && (state_link-tgt_link)>0)
+	{
+		return tgt_link+LIMIT_ANGLE_H;
+	}
+	else if (abs(state_link-tgt_link)>LIMIT_ANGLE_H && (state_link-tgt_link)<0)
+	{
+		return tgt_link-LIMIT_ANGLE_H;
+	}
+
+	return state_link;
+}
+
+float update_tgt_v(float state_link,float tgt_link)
+{
+	if (abs(state_link-tgt_link)>LIMIT_ANGLE_V && (state_link-tgt_link)>0)
+	{
+		return tgt_link+LIMIT_ANGLE_V;
+	}
+	else if (abs(state_link-tgt_link)>LIMIT_ANGLE_V && (state_link-tgt_link)<0)
+	{
+		return tgt_link-LIMIT_ANGLE_V;
+	}
+
+	return state_link;
+}
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
-	static float t = 0.0;
+	static float t = 0.0f;
 
 	if(htim == &htim6) {
 		now_state.link1=
-				-2.0*(tgt_state.link1-pre_state.link1)*powf(t,3.0)/powf(0.5,3.0)+
-				3.0*(tgt_state.link1-pre_state.link1)*powf(t,2.0)/powf(0.5,2.0)+
+				-2.0*(tgt_state.link1-pre_state.link1)*powf(t,3.0)/powf(T,3.0)+
+				3.0*(tgt_state.link1-pre_state.link1)*powf(t,2.0)/powf(T,2.0)+
 				pre_state.link1;
 		__HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_1,deg2pulse(now_state.link1)); //1000(0.5ms)~3000(1.5ms)~5000(2.5ms)
 
 		now_state.link2=
-				-2.0*(tgt_state.link2-pre_state.link2)*powf(t,3.0)/powf(0.5,3.0)+
-				3.0*(tgt_state.link2-pre_state.link2)*powf(t,2.0)/powf(0.5,2.0)+
+				-2.0*(tgt_state.link2-pre_state.link2)*powf(t,3.0)/powf(T,3.0)+
+				3.0*(tgt_state.link2-pre_state.link2)*powf(t,2.0)/powf(T,2.0)+
 				pre_state.link2;
 		__HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_2,deg2pulse(now_state.link2)); //1000(0.5ms)~3000(1.5ms)~5000(2.5ms)
 
 		now_state.link3=
-				-2.0*(tgt_state.link3-pre_state.link3)*powf(t,3.0)/powf(0.5,3.0)+
-				3.0*(tgt_state.link3-pre_state.link3)*powf(t,2.0)/powf(0.5,2.0)+
+				-2.0*(tgt_state.link3-pre_state.link3)*powf(t,3.0)/powf(T,3.0)+
+				3.0*(tgt_state.link3-pre_state.link3)*powf(t,2.0)/powf(T,2.0)+
 				pre_state.link3;
 		__HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_3,deg2pulse(now_state.link3)); //1000(0.5ms)~3000(1.5ms)~5000(2.5ms)
 
 		now_state.link4=
-				-2.0*(tgt_state.link4-pre_state.link4)*powf(t,3.0)/powf(0.5,3.0)+
-				3.0*(tgt_state.link4-pre_state.link4)*powf(t,2.0)/powf(0.5,2.0)+
+				-2.0*(tgt_state.link4-pre_state.link4)*powf(t,3.0)/powf(T,3.0)+
+				3.0*(tgt_state.link4-pre_state.link4)*powf(t,2.0)/powf(T,2.0)+
 				pre_state.link4;
 		__HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_4,deg2pulse(now_state.link4)); //1000(0.5ms)~3000(1.5ms)~5000(2.5ms)
 
-		t+=0.005;
+		//t+=0.005;
+		t +=T*0.02;
 	}
 
     if(htim == &htim7) {
 		sprintf(
 			tx_buff,
-			"{\"A\":%.2f,\"B\":%.2f,\"C\":%.2f,\"D\":%.2f,\"G\":%c,\"M\":%c}\n",
-			now_state.link1,
-			now_state.link2,
-			now_state.link3,
-			now_state.link4,
-			state.glab,
+			"{\"A\":%d,\"B\":%d,\"C\":%d,\"D\":%d,\"G\":%d,\"M\":%c}\n",
+			link1_adc,
+			link2_adc,
+			link3_adc,
+			link4_adc,
+			grab_pin,
 			state.mode
 		);
-		HAL_UART_Transmit(&huart2,tx_buff,strlen(tx_buff),200);
+  		HAL_UART_Transmit(&huart2,tx_buff,strlen(tx_buff),20);
 		memset(tx_buff,0,sizeof(tx_buff));
     	t=0.0;
-    	HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
   		pre_state=tgt_state;
-    	tgt_state=state;
+
+  		//tgt_state = state;
+
+  		tgt_state.link1 = update_tgt_h(state.link1, tgt_state.link1);
+  		tgt_state.link2 = update_tgt_v(state.link2, tgt_state.link2);
+  		tgt_state.link3 = update_tgt_v(state.link3, tgt_state.link3);
+  		tgt_state.link4 = update_tgt_h(state.link4, tgt_state.link4);
+  		tgt_state.glab = state.glab;
+  		tgt_state.mode = state.mode;
     }
 }
 
@@ -298,22 +355,24 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART2_UART_Init();
   MX_TIM6_Init();
   MX_TIM7_Init();
   MX_TIM3_Init();
   MX_TIM4_Init();
+  MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_2);
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3);
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_4);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-  __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_1,3000); //1000(0.5ms)~3000(1.5ms)~5000(2.5ms)
-  __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_2,3000); //1000(0.5ms)~3000(1.5ms)~5000(2.5ms)
-  __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_3,3000); //1000(0.5ms)~3000(1.5ms)~5000(2.5ms)
-  __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_4,3000); //1000(0.5ms)~3000(1.5ms)~5000(2.5ms)
-  __HAL_TIM_SET_COMPARE(&htim3,TIM_CHANNEL_1,3000); //1000(0.5ms)~3000(1.5ms)~5000(2.5ms)
+  __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_2,deg2pulse(0.0)); //1000(0.5ms)~3000(1.5ms)~5000(2.5ms)
+  __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_1,deg2pulse(0.0)); //1000(0.5ms)~3000(1.5ms)~5000(2.5ms)
+  __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_3,deg2pulse(50.0)); //1000(0.5ms)~3000(1.5ms)~5000(2.5ms)
+  __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_4,deg2pulse(0.0)); //1000(0.5ms)~3000(1.5ms)~5000(2.5ms)
+  __HAL_TIM_SET_COMPARE(&htim3,TIM_CHANNEL_1,deg2pulse(0.0)); //1000(0.5ms)~3000(1.5ms)~5000(2.5ms)
   HAL_UART_Receive_IT(&huart2, dma_rx_buff, 1);
   HAL_TIM_Base_Start_IT(&htim6);
   HAL_TIM_Base_Start_IT(&htim7);
@@ -321,11 +380,43 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  memset(g_ADCBuffer, 0, sizeof(g_ADCBuffer));
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)g_ADCBuffer, 4);
   while (1)
   {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	  if( __HAL_UART_GET_FLAG(&huart2, UART_FLAG_ORE))
+	  {
+		HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+		HAL_NVIC_DisableIRQ(USART2_IRQn);
+		__disable_irq();
+
+		//一応フラグをクリアする
+		__HAL_UART_CLEAR_NEFLAG(&huart2);
+		__HAL_UART_CLEAR_OREFLAG(&huart2);
+
+		//UARTを初期化する．DeInitいらない説
+		HAL_UART_DeInit(&huart2);
+		MX_USART2_UART_Init();
+
+		//再開？
+		HAL_UART_Abort_IT(&huart2);
+
+		//割り込みの再開
+		__enable_irq();
+		HAL_NVIC_EnableIRQ(USART2_IRQn);
+
+	 	HAL_UART_Receive_IT(&huart2, dma_rx_buff, 1);
+	  }
+
+	  grab_pin = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8);
+	  link1_adc = g_ADCBuffer[0];
+	  link2_adc = g_ADCBuffer[1];
+	  link3_adc = g_ADCBuffer[2];
+	  link4_adc = g_ADCBuffer[3];
+
   }
   /* USER CODE END 3 */
 }
@@ -382,6 +473,85 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.ScanConvMode = ENABLE;
+  hadc1.Init.ContinuousConvMode = ENABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 4;
+  hadc1.Init.DMAContinuousRequests = ENABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SEQ_CONV;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_0;
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Rank = 2;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_8;
+  sConfig.Rank = 3;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_11;
+  sConfig.Rank = 4;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
 }
 
 /**
@@ -534,7 +704,7 @@ static void MX_TIM6_Init(void)
   htim6.Instance = TIM6;
   htim6.Init.Prescaler = 900;
   htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim6.Init.Period = 500;
+  htim6.Init.Period = 100;
   htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
   {
@@ -572,7 +742,7 @@ static void MX_TIM7_Init(void)
   htim7.Instance = TIM7;
   htim7.Init.Prescaler = 9000;
   htim7.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim7.Init.Period = 5000;
+  htim7.Init.Period = 500;
   htim7.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim7) != HAL_OK)
   {
@@ -624,6 +794,22 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA2_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -648,6 +834,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PA8 */
+  GPIO_InitStruct.Pin = GPIO_PIN_8;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
 /* USER CODE BEGIN MX_GPIO_Init_2 */
